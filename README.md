@@ -2,6 +2,8 @@
 
 A small desktop tool (Python + Tkinter) that receives Art-Net DMX on the network interface you choose and sends it out through any USB-to-serial adapter.
 
+<img src="docs/screenshot.png" alt="Art-Net to USB main window: network interface picker, outputs table, DMX monitor and log" width="640">
+
 ## Features
 
 - **Choose the network interface** to listen on, or listen on all of them. On macOS it uses `IP_BOUND_IF`, so broadcast Art-Net still arrives. On Linux it uses `SO_BINDTODEVICE`, or filters by subnet if it lacks the permission. On Windows it binds to the interface's IP.
