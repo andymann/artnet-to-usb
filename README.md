@@ -16,19 +16,58 @@ A small desktop tool (Python + Tkinter) that receives Art-Net DMX on the network
 
 ## Run
 
-Requires Python 3.9+ with Tk. Check with `python3 -c "import tkinter"`; with Homebrew Python, `brew install python-tk@3.x` adds Tk (replace `3.x` with your version).
+Requires Python 3.9+ with **Tk 8.6 or newer**.
 
-From the project folder:
+### macOS
+
+Don't use Apple's built-in `/usr/bin/python3` (Python 3.9 from the Command Line Tools): it ships the deprecated Tk 8.5, and the window opens **empty**, with `DEPRECATION WARNING: The system version of Tk is deprecated` in the terminal. Install Python from [Homebrew](https://brew.sh) instead:
 
 ```bash
-python3 -m venv .venv
+brew install python@3.13 python-tk@3.13
+```
+
+Then, from the project folder:
+
+```bash
+python3.13 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python -m artnet_to_usb          # main tool
 python -m artnet_to_usb.auto     # auto-forwarder
 ```
 
-Later, only `source .venv/bin/activate` and the `python -m …` line are needed. Run `deactivate` to leave the venv.
+If you already have a `.venv` made with Apple's Python, delete it first (`deactivate; rm -rf .venv`). Creating the new venv on top of the old one keeps `python` pointing at Python 3.9.
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt install python3 python3-venv python3-tk
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m artnet_to_usb
+```
+
+### Windows (PowerShell)
+
+Install Python from [python.org](https://www.python.org/downloads/) (it includes Tk), then:
+
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m artnet_to_usb
+```
+
+### Check the setup
+
+With the venv active, this should print a Tk version of 8.6 or newer:
+
+```bash
+python -c "import sys, tkinter; print(sys.version.split()[0], 'Tk', tkinter.TkVersion)"
+```
+
+Later, only activating the venv and the `python -m …` line are needed. Run `deactivate` to leave the venv.
 
 Then pick an interface, click **Add…** to map a universe to a serial port, and click **Start**.
 
