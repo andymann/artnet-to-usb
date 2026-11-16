@@ -1,6 +1,7 @@
 """Art-Net receiver: listens for ArtDmx packets on a chosen network interface."""
 
 import ipaddress
+import select
 import socket
 import struct
 import sys
@@ -101,19 +102,25 @@ class ArtNetReceiver(threading.Thread):
         self._stop_event = threading.Event()
         self._filter_net = None
         self._seen = set()
+        self._local_ips = {i.ip for i in list_interfaces()}
         self.sock = self._open_socket()
+        self.socks = [self.sock]
+        self._tx = None  # lazily created, unbound socket for broadcasts off a bound interface
+        self.socks_to_close = []
+        if self.sock.getsockname()[0] != "127.0.0.1":
+            # Consoles on this machine also bind *:6454, and macOS/BSD hand unicast to the
+            # first wildcard socket bound, so if the console started first it swallows
+            # everything sent to 127.0.0.1. A socket bound to 127.0.0.1 itself is more
+            # specific and always wins. Broadcasts still arrive on the wildcard socket only.
+            # (Not done for LAN IPs: that would also steal unicast meant for the console,
+            # such as other nodes' ArtPollReplies.)
+            try:
+                self.socks.append(_udp_socket(("127.0.0.1", ARTNET_PORT)))
+            except OSError as e:
+                self.log(f"Could not bind 127.0.0.1:{ARTNET_PORT} ({e}); local unicast may be missed")
 
     def _open_socket(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(0.5)
-
+        sock = _udp_socket(None)
         bind_ip = ""
         iface = self.interface
         if iface is not None:
@@ -135,6 +142,11 @@ class ArtNetReceiver(threading.Thread):
         sock.bind((bind_ip, ARTNET_PORT))
         return sock
 
+    def _accept(self, addr):
+        if self._filter_net is None or addr[0] in self._local_ips or addr[0].startswith("127."):
+            return True  # senders on this machine are always accepted
+        return ipaddress.IPv4Address(addr[0]) in self._filter_net
+
     def stop(self):
         self._stop_event.set()
 
@@ -145,20 +157,21 @@ class ArtNetReceiver(threading.Thread):
             self._send_poll_replies()  # unsolicited announcement
             while not self._stop_event.is_set():
                 try:
-                    packet, addr = self.sock.recvfrom(1024)
-                except socket.timeout:
-                    continue
+                    ready, _, _ = select.select(self.socks, [], [], 0.5)
+                    received = [s.recvfrom(1024) for s in ready]
                 except OSError as e:
                     if not self._stop_event.is_set():
                         self.log(f"Socket error: {e}")
                     break
-                if self._filter_net and ipaddress.IPv4Address(addr[0]) not in self._filter_net:
-                    self._log_once(("filtered", addr[0]),
-                                   f"Ignoring Art-Net from {addr[0]} (not on {self._filter_net})")
-                    continue
-                self._handle_packet(packet, addr)
+                for packet, addr in received:
+                    if not self._accept(addr):
+                        self._log_once(("filtered", addr[0]),
+                                       f"Ignoring Art-Net from {addr[0]} (not on {self._filter_net})")
+                        continue
+                    self._handle_packet(packet, addr)
         finally:
-            self.sock.close()
+            for s in self.socks + self.socks_to_close:
+                s.close()
             self.log("Art-Net receiver stopped")
 
     def _log_once(self, key, msg):
@@ -182,7 +195,7 @@ class ArtNetReceiver(threading.Thread):
             self._log_once(("poll", addr[0]), f"ArtPoll from {addr[0]}:{addr[1]}, replying")
             self._send_poll_replies(addr)
         elif opcode == OP_POLL_REPLY:
-            if addr[0] not in {i.ip for i in list_interfaces()}:  # skip our own echo
+            if addr[0] not in self._local_ips:  # skip our own echo
                 name = packet[26:44].split(b"\0", 1)[0].decode("ascii", "replace")
                 self._log_once(("node", addr[0]), f"Saw Art-Net node {name!r} at {addr[0]}")
         else:
@@ -221,10 +234,19 @@ class ArtNetReceiver(threading.Thread):
                 chunks.append((netsub, unis[i : i + 4]))
         if not chunks:
             chunks = [(0, [])]
+        local_poller = addr is not None and (addr[0] in self._local_ips or addr[0].startswith("127."))
         for iface in self._reply_interfaces(addr):
+            sock = self.sock
             if iface.network.is_loopback:
-                # macOS loopback has no broadcast; unicast is the best we can do there.
-                dests = [addr] if addr is not None else []
+                # Loopback has no broadcast, and unicast to 127.0.0.1:6454 would land in our
+                # own 127.0.0.1 socket. A console on this machine also hears LAN broadcasts,
+                # so broadcast there (via an interface-neutral socket) and unicast only to
+                # pollers listening on a port of their own.
+                dests = [addr] if addr is not None and addr[1] != ARTNET_PORT else []
+                if local_poller and addr[1] == ARTNET_PORT:
+                    dests += [(str(i.network.broadcast_address), ARTNET_PORT)
+                              for i in list_interfaces() if not i.network.is_loopback]
+                    sock = self._tx_socket()
             else:
                 dests = [(str(iface.network.broadcast_address), ARTNET_PORT)]
                 if addr is not None and addr[1] != ARTNET_PORT:
@@ -234,9 +256,28 @@ class ArtNetReceiver(threading.Thread):
                 pkt = _poll_reply(iface.ip, netsub, unis, bind_index, mac)
                 for dest in dests:
                     try:
-                        self.sock.sendto(pkt, dest)
+                        sock.sendto(pkt, dest)
                     except OSError as e:
                         self._log_once(("replyerr", dest[0], str(e)), f"ArtPollReply to {dest[0]} failed: {e}")
+
+    def _tx_socket(self):
+        if self._tx is None:
+            self._tx = _udp_socket(None)
+            self.socks_to_close.append(self._tx)
+        return self._tx
+
+def _udp_socket(bind_addr):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    if bind_addr is not None:
+        sock.bind(bind_addr)
+    return sock
 
 
 def _mac_for(ifname):
