@@ -56,13 +56,13 @@ class SerialOutput(threading.Thread):
         self.cfg = cfg
         self.store = store
         self.log = log
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.ser = None
         self.frames_sent = 0
         self.status = "starting"
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def _open(self):
         c = self.cfg
@@ -93,7 +93,7 @@ class SerialOutput(threading.Thread):
         c = self.cfg
         period = 1.0 / max(1.0, c.rate_hz)
         channels = max(1, min(512, c.channels))
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if self.ser is None:
                 try:
                     self.ser = self._open()
@@ -102,7 +102,7 @@ class SerialOutput(threading.Thread):
                 except (serial.SerialException, OSError, ValueError) as e:
                     self.status = f"error: {e}"
                     self.log(f"Cannot open {c.port}: {e}; retrying")
-                    self._stop.wait(2.0)
+                    self._stop_event.wait(2.0)
                     continue
             start = time.monotonic()
             frame = self.store.get(c.universe) or bytes(512)
@@ -113,9 +113,9 @@ class SerialOutput(threading.Thread):
                 self.status = f"error: {e}"
                 self.log(f"Write to {c.port} failed: {e}; reopening")
                 self._close()
-                self._stop.wait(1.0)
+                self._stop_event.wait(1.0)
                 continue
-            self._stop.wait(max(0.0, period - (time.monotonic() - start)))
+            self._stop_event.wait(max(0.0, period - (time.monotonic() - start)))
         self._close()
         self.status = "stopped"
 

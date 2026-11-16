@@ -98,8 +98,9 @@ class ArtNetReceiver(threading.Thread):
         self.interface = interface  # Interface or None for all
         self.universes_fn = universes_fn
         self.log = log
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._filter_net = None
+        self._seen = set()
         self.sock = self._open_socket()
 
     def _open_socket(self):
@@ -135,39 +136,52 @@ class ArtNetReceiver(threading.Thread):
         return sock
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
         where = self.interface.label if self.interface else "all interfaces"
         self.log(f"Listening for Art-Net on {where}, UDP {ARTNET_PORT}")
         try:
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     packet, addr = self.sock.recvfrom(1024)
                 except socket.timeout:
                     continue
                 except OSError as e:
-                    if not self._stop.is_set():
+                    if not self._stop_event.is_set():
                         self.log(f"Socket error: {e}")
                     break
                 if self._filter_net and ipaddress.IPv4Address(addr[0]) not in self._filter_net:
+                    self._log_once(("filtered", addr[0]),
+                                   f"Ignoring Art-Net from {addr[0]} (not on {self._filter_net})")
                     continue
-                self._handle(packet, addr)
+                self._handle_packet(packet, addr)
         finally:
             self.sock.close()
             self.log("Art-Net receiver stopped")
 
-    def _handle(self, packet, addr):
+    def _log_once(self, key, msg):
+        if key not in self._seen:
+            self._seen.add(key)
+            self.log(msg)
+
+    def _handle_packet(self, packet, addr):
         if len(packet) < 10 or packet[:8] != ARTNET_ID:
+            self._log_once(("junk", addr[0]), f"Non-Art-Net packet from {addr[0]}:{addr[1]} ({len(packet)} bytes)")
             return
         opcode = struct.unpack_from("<H", packet, 8)[0]
         if opcode == OP_DMX and len(packet) >= 18:
             sub_uni, net, length = struct.unpack_from(">BBH", packet, 14)
             universe = ((net & 0x7F) << 8) | sub_uni
             data = packet[18 : 18 + min(length, 512)]
+            self._log_once(("dmx", addr[0], universe),
+                           f"ArtDmx from {addr[0]}:{addr[1]} → universe {universe} ({format_universe(universe)}), {len(data)} ch")
             self.store.update(universe, data, addr[0])
         elif opcode == OP_POLL:
+            self._log_once(("poll", addr[0]), f"ArtPoll from {addr[0]}:{addr[1]}, replying")
             self._send_poll_replies(addr)
+        else:
+            self._log_once(("op", addr[0], opcode), f"Art-Net opcode 0x{opcode:04x} from {addr[0]}:{addr[1]} (ignored)")
 
     def _send_poll_replies(self, addr):
         universes = sorted(set(self.universes_fn()))
