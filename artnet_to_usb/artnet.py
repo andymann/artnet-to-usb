@@ -142,6 +142,7 @@ class ArtNetReceiver(threading.Thread):
         where = self.interface.label if self.interface else "all interfaces"
         self.log(f"Listening for Art-Net on {where}, UDP {ARTNET_PORT}")
         try:
+            self._send_poll_replies()  # unsolicited announcement
             while not self._stop_event.is_set():
                 try:
                     packet, addr = self.sock.recvfrom(1024)
@@ -180,10 +181,35 @@ class ArtNetReceiver(threading.Thread):
         elif opcode == OP_POLL:
             self._log_once(("poll", addr[0]), f"ArtPoll from {addr[0]}:{addr[1]}, replying")
             self._send_poll_replies(addr)
+        elif opcode == OP_POLL_REPLY:
+            if addr[0] not in {i.ip for i in list_interfaces()}:  # skip our own echo
+                name = packet[26:44].split(b"\0", 1)[0].decode("ascii", "replace")
+                self._log_once(("node", addr[0]), f"Saw Art-Net node {name!r} at {addr[0]}")
         else:
             self._log_once(("op", addr[0], opcode), f"Art-Net opcode 0x{opcode:04x} from {addr[0]}:{addr[1]} (ignored)")
 
-    def _send_poll_replies(self, addr):
+    def _reply_interfaces(self, addr):
+        """Interfaces to announce on: the chosen one, else the one facing the poller."""
+        if self.interface is not None:
+            return [self.interface]
+        ifaces = list_interfaces()
+        if addr is not None:
+            remote = ipaddress.IPv4Address(addr[0])
+            match = [i for i in ifaces if remote in i.network]
+            if match:
+                return match[:1]
+            ip = _local_ip_for(addr[0])
+            return [i for i in ifaces if i.ip == ip][:1] or [Interface("", ip, "255.255.255.255")]
+        return [i for i in ifaces if not i.network.is_loopback]
+
+    def _send_poll_replies(self, addr=None):
+        """Send ArtPollReply. addr is the poller, or None for an unsolicited announcement.
+
+        Replies go to the directed broadcast address on port 6454, as the Art-Net spec
+        requires. Unicasting back to the poller fails when the controller runs on the same
+        host: both sockets share port 6454 and the OS delivers unicast to only one of them,
+        often our own.
+        """
         universes = sorted(set(self.universes_fn()))
         # One reply per group of up to 4 universes sharing Net/Sub-Net.
         groups = {}
@@ -195,12 +221,34 @@ class ArtNetReceiver(threading.Thread):
                 chunks.append((netsub, unis[i : i + 4]))
         if not chunks:
             chunks = [(0, [])]
-        ip = self.interface.ip if self.interface else _local_ip_for(addr[0])
-        for bind_index, (netsub, unis) in enumerate(chunks, start=1):
+        for iface in self._reply_interfaces(addr):
+            if iface.network.is_loopback:
+                # macOS loopback has no broadcast; unicast is the best we can do there.
+                dests = [addr] if addr is not None else []
+            else:
+                dests = [(str(iface.network.broadcast_address), ARTNET_PORT)]
+                if addr is not None and addr[1] != ARTNET_PORT:
+                    dests.append(addr)  # poller listens on its own port as well
+            mac = _mac_for(iface.name)
+            for bind_index, (netsub, unis) in enumerate(chunks, start=1):
+                pkt = _poll_reply(iface.ip, netsub, unis, bind_index, mac)
+                for dest in dests:
+                    try:
+                        self.sock.sendto(pkt, dest)
+                    except OSError as e:
+                        self._log_once(("replyerr", dest[0], str(e)), f"ArtPollReply to {dest[0]} failed: {e}")
+
+
+def _mac_for(ifname):
+    for addr in psutil.net_if_addrs().get(ifname, []):
+        if addr.family == psutil.AF_LINK and addr.address:
             try:
-                self.sock.sendto(_poll_reply(ip, netsub, unis, bind_index), addr)
-            except OSError as e:
-                self.log(f"ArtPollReply failed: {e}")
+                mac = bytes.fromhex(addr.address.replace(":", "").replace("-", ""))
+            except ValueError:
+                continue
+            if len(mac) == 6:
+                return mac
+    return bytes(6)
 
 
 def _local_ip_for(remote_ip):
@@ -212,7 +260,7 @@ def _local_ip_for(remote_ip):
         return "0.0.0.0"
 
 
-def _poll_reply(ip, netsub, unis, bind_index):
+def _poll_reply(ip, netsub, unis, bind_index, mac=bytes(6)):
     port_types = bytes([0x80 if i < len(unis) else 0 for i in range(4)])  # 0x80 = DMX output
     good_output = bytes([0x80 if i < len(unis) else 0 for i in range(4)])
     sw_out = bytes(unis + [0] * (4 - len(unis)))
@@ -238,7 +286,7 @@ def _poll_reply(ip, netsub, unis, bind_index):
     pkt += bytes([0, 0, 0])  # AcnPriority, SwMacro, SwRemote
     pkt += bytes(3)  # spare
     pkt += bytes([0x00])  # Style: StNode
-    pkt += bytes(6)  # MAC
+    pkt += mac  # MAC
     pkt += socket.inet_aton(ip)  # BindIp
     pkt += bytes([bind_index, 0x08])  # BindIndex, Status2 (15-bit port address)
     pkt += bytes(4)  # GoodOutputB

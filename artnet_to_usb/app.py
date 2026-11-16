@@ -148,6 +148,7 @@ class App(tk.Tk):
         self._last_counts = {}
         self._last_frames = {}
         self._last_tick = time.monotonic()
+        self._next_iface_check = 0.0
         self.interfaces = []
 
         self.iface_var = tk.StringVar()
@@ -234,8 +235,25 @@ class App(tk.Tk):
         if current not in labels:
             # Match by interface name if its IP changed.
             name = current.split(" (")[0] if current else ""
-            current = next((i.label for i in self.interfaces if i.name == name), ANY_INTERFACE)
+            match = next((i.label for i in self.interfaces if i.name == name), None)
+            if current:
+                if match:
+                    self.log(f"Interface {name} changed address: {current} → {match}")
+                else:
+                    self.log(f"WARNING: interface {current} not found, falling back to {ANY_INTERFACE}")
+            current = match or ANY_INTERFACE
         self.iface_var.set(current)
+
+    def _check_interface(self):
+        """While running, follow the bound interface; fall back to Any if it vanished."""
+        running = self.receiver.interface if self.receiver is not None else None
+        if running is None:
+            return
+        if any(i.name == running.name and i.ip == running.ip for i in list_interfaces()):
+            return
+        self._refresh_interfaces()  # logs the change / fallback
+        self._stop()
+        self._start()
 
     def _selected_interface(self):
         label = self.iface_var.get()
@@ -305,6 +323,7 @@ class App(tk.Tk):
             self._stop()
 
     def _start(self):
+        self._refresh_interfaces()  # drop interfaces that vanished since the list was built
         iface = self._selected_interface()
         try:
             self.receiver = ArtNetReceiver(
@@ -394,6 +413,9 @@ class App(tk.Tk):
                 self.tree.set(iid, "status", status)
 
         self._update_monitor(stats, rates, now)
+        if now >= self._next_iface_check:
+            self._next_iface_check = now + 3.0
+            self._check_interface()
         self.after(250, self._tick)
 
     def _update_monitor(self, stats, rates, now):
